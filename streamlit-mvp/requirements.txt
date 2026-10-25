@@ -1,0 +1,5 @@
+streamlit>=1.35,<2
+requests>=2.31,<3
+pypdf>=4,<7
+python-docx>=1.1,<2
+reportlab>=4.2,<5
