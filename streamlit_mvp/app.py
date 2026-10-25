@@ -16,6 +16,7 @@ from core import (
     split_text,
 )
 from reporting import build_markdown, build_pdf, find_gaps
+from theme import apply_theme, hero
 
 REPORT_FORMAT_VERSION = 2
 
@@ -55,8 +56,8 @@ def normalized_gap_answer(gap, value):
 
 
 st.set_page_config(page_title="ExitKit AI", page_icon="📦", layout="wide")
-st.title("📦 ExitKit AI")
-st.caption("Локальный AI-помощник для передачи дел и сохранения знаний")
+apply_theme()
+hero()
 
 with st.sidebar:
     st.subheader("⚙️ Настройки")
