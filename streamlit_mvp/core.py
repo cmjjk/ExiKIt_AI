@@ -10,13 +10,13 @@ from docx import Document
 from pypdf import PdfReader
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
+MODEL = os.getenv("OLLAMA_MODEL", "qwen3:0.6b")
 CHUNK_CHARS = 3000
 MAX_FILE_CHARS = 60000
 MAX_TOTAL_CHUNKS = 20
 SECTIONS = ("projects", "tasks", "risks", "contacts", "instructions", "agreements")
 RUSSIAN_FIELDS = {"summary", "status", "background", "next_steps", "decisions", "task", "deadline", "details", "risk", "impact", "mitigation", "role", "context", "steps", "topic"}
-UNKNOWN_VALUES = {"unknown", "not specified", "not provided", "n/a", "none", "null"}
+UNKNOWN_VALUES = {"unknown", "not specified", "not provided", "n/a", "none", "null", "неизвестно", "не указано", "не указан"}
 
 
 class EnglishOutputError(ValueError):
@@ -24,9 +24,10 @@ class EnglishOutputError(ValueError):
 
 
 def _english_prose(value):
+    value = re.sub(r"\b[A-Za-z0-9_-]+(?: \(\d+\))?\.(?:txt|md|pdf|docx)\b", "", value, flags=re.IGNORECASE)
     latin = re.findall(r"[A-Za-z]{2,}", value)
     cyrillic = re.findall(r"[А-Яа-яЁё]{2,}", value)
-    return bool(latin) and ((not cyrillic and any(len(word) >= 4 for word in latin)) or len(latin) >= 3 and len(latin) > 2 * len(cyrillic))
+    return bool(latin) and ((not cyrillic and any(len(word) >= 4 for word in latin)) or len(latin) >= 4 and len(latin) > 2 * len(cyrillic))
 
 
 def _object(fields):
@@ -90,14 +91,18 @@ def split_text(value, max_chars=CHUNK_CHARS):
     return chunks
 
 
-def _validate(data, filename):
+def _validate(data, filename, allow_english_fallback=False):
     if not isinstance(data, dict):
         raise ValueError("Ollama вернула данные не в виде объекта")
     clean = {"summary": data.get("summary", "")}
     if not isinstance(clean["summary"], str):
         clean["summary"] = ""
+    english_removed = False
     if _english_prose(clean["summary"]):
-        raise EnglishOutputError("Модель ответила по-английски")
+        if not allow_english_fallback:
+            raise EnglishOutputError("Модель ответила по-английски")
+        clean["summary"] = ""
+        english_removed = True
     for section in SECTIONS:
         values = data.get(section, [])
         if not isinstance(values, list):
@@ -109,15 +114,36 @@ def _validate(data, filename):
                 continue
             normalized = {field: str(item.get(field) or "").strip() for field in expected}
             normalized = {field: ("Неизвестно" if value.casefold() in UNKNOWN_VALUES else value) for field, value in normalized.items()}
+            if section == "tasks":
+                named_owner = re.match(r"^([А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+) долж(?:ен|на)\b", normalized["task"])
+                if named_owner:
+                    normalized["owner"] = named_owner.group(1)
+                elif re.search(r"ответственн\w*[^.!?]*не назначен", f"{normalized['status']} {normalized['details']}", flags=re.IGNORECASE):
+                    normalized["owner"] = "Не назначен"
+            if section == "instructions" and ("вопрос" in normalized["title"].casefold() or "?" in normalized["title"]):
+                continue
+            if section == "agreements" and normalized["details"] in ("", "Неизвестно"):
+                continue
             if normalized[expected[0]]:
-                if any(_english_prose(value) for field, value in normalized.items() if field in RUSSIAN_FIELDS):
-                    raise EnglishOutputError("Модель ответила по-английски")
+                for field, value in normalized.items():
+                    if field in RUSSIAN_FIELDS and _english_prose(value):
+                        if not allow_english_fallback:
+                            raise EnglishOutputError("Модель ответила по-английски")
+                        normalized[field] = "Неизвестно"
+                        english_removed = True
+                if normalized[expected[0]] == "Неизвестно":
+                    continue
                 normalized["source"] = filename
                 clean[section].append(normalized)
     questions = data.get("open_questions", [])
-    clean["open_questions"] = [q.strip() for q in questions if isinstance(q, str) and q.strip()] if isinstance(questions, list) else []
+    clean["open_questions"] = [q.strip() for q in questions if isinstance(q, str) and q.strip() and q.strip().casefold() not in UNKNOWN_VALUES] if isinstance(questions, list) else []
     if any(_english_prose(question) for question in clean["open_questions"]):
-        raise EnglishOutputError("Модель ответила по-английски")
+        if not allow_english_fallback:
+            raise EnglishOutputError("Модель ответила по-английски")
+        clean["open_questions"] = [question for question in clean["open_questions"] if not _english_prose(question)]
+        english_removed = True
+    if english_removed:
+        clean["open_questions"].append("Проверьте исходный документ: часть сведений модель не смогла изложить по-русски.")
     if not any(clean[section] for section in SECTIONS):
         raise ValueError("Модель вернула пустые разделы. Попробуйте более сильную модель или уменьшите документ.")
     return clean
@@ -131,7 +157,10 @@ def analyze(source, filename, final_chunk=True):
         "Не выдумывай факты. Если значение неизвестно, пиши 'Неизвестно'. "
         "Заполняй все разделы JSON. Проекты — в projects, незавершённые действия — в tasks, "
         "риски — в risks, люди — в contacts. Сохраняй конкретные имена, даты и детали. "
-        "Для каждого упомянутого проекта и каждой задачи создай отдельный элемент."
+        "Для каждого упомянутого проекта и каждой задачи создай отдельный элемент. "
+        "В next_steps записывай только то, что ещё предстоит сделать; уже выполненное записывай в background или status. "
+        "Если ответственный не назначен, owner должен быть 'Не назначен'; не назначай упомянутого рядом человека. "
+        "Не превращай открытый вопрос в инструкцию. Не выдумывай последствия риска, если их нет в источнике."
     )
     for attempt in range(2):
         try:
@@ -140,9 +169,10 @@ def analyze(source, filename, final_chunk=True):
                 json={
                     "model": MODEL,
                     "stream": False,
+                    "think": False,
                     "format": SCHEMA,
                     "keep_alive": 0 if final_chunk else "1m",
-                    "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 1400},
+                    "options": {"temperature": 0, "num_ctx": 3072, "num_predict": 1200},
                     "messages": [
                         {"role": "system", "content": system + (" Ответ на русском языке обязателен." if attempt else "")},
                         {"role": "user", "content": f"Файл: {filename}\n\n{source}"},
@@ -152,10 +182,17 @@ def analyze(source, filename, final_chunk=True):
             )
             response.raise_for_status()
             content = response.json()["message"]["content"]
-            return _validate(json.loads(content), filename)
-        except EnglishOutputError as exc:
-            if attempt:
-                raise ValueError("Модель дважды ответила по-английски. Выберите модель, которая поддерживает русский язык.") from exc
+            data = json.loads(content)
+            try:
+                result = _validate(data, filename)
+            except EnglishOutputError:
+                if not attempt:
+                    continue
+                result = _validate(data, filename, allow_english_fallback=True)
+            for question in re.findall(r"(?im)^\s*Открытый вопрос:\s*(.+?)\s*$", source):
+                if question not in result["open_questions"]:
+                    result["open_questions"].append(question)
+            return result
         except (KeyError, json.JSONDecodeError) as exc:
             raise ValueError("Ollama вернула повреждённый JSON. Уменьшите документ или смените модель.") from exc
 

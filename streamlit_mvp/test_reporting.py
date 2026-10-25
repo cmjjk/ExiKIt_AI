@@ -1,8 +1,10 @@
 """Checks for the short reader-facing report."""
 
+import json
 import unittest
+from unittest.mock import patch
 
-from core import EnglishOutputError, _validate
+from core import EnglishOutputError, MODEL, _english_prose, _validate, analyze
 from reporting import build_markdown, build_pdf
 from streamlit.testing.v1 import AppTest
 
@@ -21,6 +23,19 @@ def example_data():
 
 
 class ReportingTests(unittest.TestCase):
+    def test_small_model_request_disables_thinking(self):
+        with patch("core.requests.post") as post:
+            data = example_data()
+            data["open_questions"] = ["неизвестно"]
+            post.return_value.json.return_value = {"message": {"content": json.dumps(data)}}
+            result = analyze("Проект CRM: проверить дубликаты клиентов.\nОткрытый вопрос: кто отвечает за интеграцию?", "example.txt")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], MODEL)
+        self.assertFalse(payload["think"])
+        self.assertEqual(payload["options"]["num_ctx"], 3072)
+        self.assertEqual(payload["keep_alive"], 0)
+        self.assertEqual(result["open_questions"], ["кто отвечает за интеграцию?"])
+
     def test_short_russian_report_and_pdf(self):
         data = example_data()
         markdown = build_markdown(data, ["example.txt"])
@@ -38,6 +53,35 @@ class ReportingTests(unittest.TestCase):
         data["tasks"][0]["status"] = "In progress"
         with self.assertRaises(EnglishOutputError):
             _validate(data, "example.txt")
+
+    def test_source_filename_does_not_count_as_english_prose(self):
+        data = example_data()
+        data["summary"] = "Документ: employee_handover (1).txt"
+        self.assertEqual(_validate(data, "employee_handover (1).txt")["summary"], data["summary"])
+        self.assertFalse(_english_prose("Документ CRM Migration Guide"))
+
+    def test_repeated_english_field_does_not_discard_russian_report(self):
+        data = example_data()
+        data["tasks"][0]["status"] = "In progress"
+        with patch("core.requests.post") as post:
+            post.return_value.json.return_value = {"message": {"content": json.dumps(data)}}
+            result = analyze("Задача: проверить дубликаты клиентов", "example.txt")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(result["tasks"][0]["status"], "Неизвестно")
+        self.assertIn("часть сведений", result["open_questions"][-1])
+        self.assertNotIn("In progress", build_markdown(result, ["example.txt"]))
+
+    def test_explicitly_unassigned_task_has_no_invented_owner(self):
+        data = example_data()
+        data["tasks"][0]["owner"] = "Руководитель продаж"
+        data["tasks"][0]["status"] = "ответственный пока не назначен"
+        self.assertEqual(_validate(data, "example.txt")["tasks"][0]["owner"], "Не назначен")
+
+    def test_named_task_owner_takes_precedence(self):
+        data = example_data()
+        data["tasks"][0]["task"] = "Игорь Петров должен проверить дубликаты"
+        data["tasks"][0]["owner"] = "Не назначен"
+        self.assertEqual(_validate(data, "example.txt")["tasks"][0]["owner"], "Игорь Петров")
 
     def test_old_english_prose_is_hidden_from_report(self):
         data = example_data()
